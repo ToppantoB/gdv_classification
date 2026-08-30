@@ -1,63 +1,80 @@
-import argparse
-from pathlib import Path
-
-import torch
-
-from torch.utils.data import DataLoader, Subset
-
 from dataset.dataloader import get_dataloader
-from model.model import get_model, get_xrv_model
-from training.training import train
-from utils import enforce_reproducibility
+from model_dir.model import get_model
 
 import numpy as np
-from sklearn.model_selection import train_test_split
+from pathlib import Path
+from eval.five_fold_eval import run_5fold_evaluation
+from local_config import CONFIG, DEVICE
+from utils import enforce_reproducibility, process_and_extract_best_metrics
+   
+    
+def run_training(number_of_runs, 
+                 data_path):
+  
+    epochs = CONFIG.training_epochs
+    output_paths = [CONFIG.accuracy_result_outputs]
+    if CONFIG.with_per_epoch_output:
+      output_paths.extend([CONFIG.per_epoch_report_output, CONFIG.summary_report_output])
+
+    for output_path in output_paths:
+      Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    randoms = np.arange(number_of_runs)
+    
+    for random_seed in randoms:
+      if CONFIG.with_accuracy_outputs:
+        with open(CONFIG.accuracy_result_outputs, "a") as f:
+          f.write(f"\nRandom seed: {random_seed}\n")
+      
+      if CONFIG.with_per_epoch_output:
+        with open(CONFIG.per_epoch_report_output, "a") as f:
+          f.write(f"\nRandom seed: {random_seed}\n")
+
+      for (multi_modal, weights_path, pooling, view) in CONFIG.training_config:
+        
+        # logging
+        modality = f"{'Standard' if not multi_modal else 'Multi-Modal'}"
+        backbone_type = f"{'(MoCo pre-trained), ' if weights_path is not None else ''}"
+        pooling_type = f"{'Attention pooling' if pooling == 'attention' else ('Max pooling' if pooling == 'max' else 'Mean pooling with')}"
+        view_type = f"{view} view."
+          
+        if CONFIG.with_accuracy_outputs:
+          with open(CONFIG.accuracy_result_outputs, "a") as f:
+            f.write(f"\n{modality}, {backbone_type}{pooling_type}, {view_type}\n\n")
+        
+        if CONFIG.with_per_epoch_output:
+          with open(CONFIG.per_epoch_report_output, "a") as f:
+            f.write(f"\n{modality}, {backbone_type}{pooling_type}, {view_type}\n\n")
+        # logging end
+          
+        enforce_reproducibility(random_seed)
+        
+        dataloader = get_dataloader(data_path, batch_size=4, shuffle=True, multi_modal=multi_modal, view=view)
+        
+        indices = np.arange(len(dataloader.dataset))
+        labels = [dataloader.dataset.labels_dict[dataloader.dataset.patient_ids[i]] for i in indices]
+        
+        model = get_model(weights_path=weights_path, 
+                    multi_modal=multi_modal, 
+                    pooling=pooling,
+                    device=DEVICE)
+        
+        run_5fold_evaluation(dataloader.dataset, 
+                            labels, 
+                            model, 
+                            epochs=epochs, 
+                            multi_modal=multi_modal,
+                            device=DEVICE,
+                            random_state=random_seed)
 
 if __name__ == "__main__":
-    enforce_reproducibility(42)
+    print(f"Configured global multi-modal flag: {CONFIG.multi_modal}.")
+    print(f"Using device: {DEVICE}.")
 
-    parser = argparse.ArgumentParser()
-    # parser.add_argument("--mode", choices=["train", "pretrain", "process", "eval"], default="eval",
-    #                     help="Mode to run: train, pretrain, or process")
-    parser.add_argument("--data_type", default="256", choices=["flat", "256", "512"],
-                        help="Type of input data: flat (one channel 512x512), 256 (three channel 256x256), or 512 (three channel 512x512)")
-    parser.add_argument("--model_type", default="resnet-50", choices=["resnet-50", "xrv_resnet", "resnet-34", "resnet-18"],
-                        help="Model architecture to use")
-    parser.add_argument("--multi_modal", action=argparse.BooleanOptionalAction, default=False,
-                        help="Whether to use multi-modal inputs")
-    parser.add_argument("--weights_path", type=str, default=None,
-                        help="Path to the model weights for evaluation or fine-tuning")
+    data_path = CONFIG.data_path
 
-    args = parser.parse_args()
-    
-    print(f"Running with data type {args.data_type} and model type {args.model_type}. Multi-modal: {args.multi_modal}. Weights path: {args.weights_path}")
+    run_training(number_of_runs=CONFIG.random_seeds_to_run_for,
+                 data_path=data_path)
 
-    dataloader = get_dataloader(f"data\\combined", batch_size=4, shuffle=True)
-    # test_loader = get_dataloader(f"files\\tensors\\{args.data_type}\\labeled\\test", batch_size=32, shuffle=False)
-
-    # if args.model_type == "xrv_resnet":
-    #     model = get_xrv_model(weights_path=args.weights_path, multi_modal=args.multi_modal)
-    # else:
-    model = get_model(model_type=args.model_type, fine_tune=True, weights_path=args.weights_path, multi_modal=args.multi_modal)
-    # model = get_xrv_model()
-
-    indices = np.arange(len(dataloader.dataset))
-    labels = [dataloader.dataset.labels_dict[dataloader.dataset.patient_ids[i]] for i in indices]
-
-
-    X_train, X_test, y_train, y_test = train_test_split(indices, labels, test_size=0.2, stratify=labels, random_state=42)
-    
-    # test data loader:
-    # batch = next(iter(dataloader))
-
-    train_sub = Subset(dataloader.dataset, X_train)
-    test_sub = Subset(dataloader.dataset, X_test)
-    
-    test_loader = DataLoader(test_sub, batch_size=4, shuffle=False, collate_fn=dataloader.collate_fn)
-    train_loader = DataLoader(train_sub, batch_size=4, shuffle=True, collate_fn=dataloader.collate_fn)
-
-    # train(model, train_loader, test_loader, multi_modal=args.multi_modal)
-    
-    
-    
-    
+    if CONFIG.with_per_epoch_output:
+      process_and_extract_best_metrics(CONFIG.per_epoch_report_output, CONFIG.summary_report_output)

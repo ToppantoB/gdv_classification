@@ -1,150 +1,149 @@
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix
-import matplotlib.pyplot as plt
+from model_dir.model import freeze_batchnorm_layers
+from sklearn.metrics import recall_score, roc_auc_score
+from local_config import CONFIG
 
-
-def train(model, train_loader, test_loader, multi_modal=False, device="cuda"):
-  # Use BCEWithLogitsLoss for binary classification
+def train(model, train_loader, test_loader, device, multi_modal=False, epochs=20):
+  """Train one fold: freeze backbone first, then unfreeze for fine-tuning."""
   criterion = nn.BCEWithLogitsLoss()
 
-  # AdamW is a robust default. Use a lower learning rate for fine-tuning.
-  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-  scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
-  
-  num_epochs = 50
+  # Backbone parameters are added later with a lower learning rate after the frozen phase.
+  optimizer = torch.optim.AdamW([
+      {'params': model.weight_net.parameters(), 'lr': 1e-3},
+      {'params': model.age_net.parameters(), 'lr': 1e-3},
+      {'params': model.classifier.parameters(), 'lr': 1e-3},
+  ], weight_decay=1e-4)
+    
+  epoch_accuracies=[]
+  epoch_aucs=[]
+  epoch_losses=[]
+  epoch_recalls=[]
 
-#   evaluate(model, test_loader, -1, device)  # Evaluate before training
-  best_accuracy = 0.0
-  best_val_loss = float('inf')
-  patience = 8
-  epoch_since_improvement = 0
+  for param in model.backbone.parameters():
+    param.requires_grad = False
   
-  losses = []
-  accuracies = []
-
-  for epoch in range(num_epochs):
+  for epoch in range(epochs):
       model.train()
       running_loss = 0.0
+          
+      if epoch == CONFIG.frozen_epoch_count:
+        for param in model.backbone.parameters():
+            param.requires_grad = True
+
+        optimizer.add_param_group({
+            'params': model.backbone.parameters(),
+            'lr': 1e-5
+        })
+        
+      freeze_batchnorm_layers(model)
       
-      pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+      pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
       
-      # Assuming 'train_loader' yields (images, labels, dog_weights)
-      for images, labels in pbar:
+      # Each batch element contains one case with 1..N views; forward pass runs per case.
+      for images, data in pbar:
         predictions = []
-        labels = labels.to(device).float().unsqueeze(1)      
+                
+        labels = data[:,0].to(device).float().unsqueeze(1)
+        age = None
+        weight = None
     
         for i in range(len(images)):
-            x = images[i][0].to(device).float().unsqueeze(0) # [0] <=== take only the first image to test
-          
-            # Ensure labels are floats and shaped (batch_size, 1)
+            x = images[i].to(device).float()
             
-            # If using multi-modal, pass the dog weights to the model
-            if model.multi_modal:
-                weights = weights.to(device).float().unsqueeze(1)
+            if multi_modal:
+              age = data[i][1].to(device).float().unsqueeze(0)
+              weight = data[i][2].to(device).float().unsqueeze(0)
 
-            # 1. Zero gradients
             optimizer.zero_grad()
-            
-            # 2. Forward pass
-            prediction = model(x, weight=weights if model.multi_modal else None)
+
+            prediction = model(x, metadata=(age, weight) if model.multi_modal else None)
             predictions.append(prediction)
             
         batch_predictions = torch.cat(predictions, dim=0)
-        # 3. Calculate loss
+
         loss = criterion(batch_predictions, labels)
         
-        # 4. Backward pass and optimize
         loss.backward()
         optimizer.step()          
         running_loss += loss.item()
-          
-      val_loss, val_accuracy = evaluate(model, test_loader, epoch, device)
-      losses.append(val_loss)
-      accuracies.append(val_accuracy)
       
-      scheduler.step(val_loss)
-      
-      best_accuracy = max(best_accuracy, val_accuracy)
-            
-      if val_loss < best_val_loss:
-          epoch_since_improvement = 0
-      else:
-          epoch_since_improvement += 1
-      
-      best_val_loss = min(best_val_loss, val_loss)
-          
-    #   if epoch_since_improvement >= patience:
-    #       print(f"No improvement for {patience} epochs. Stopping early.")
-    #       break
+      if CONFIG.with_per_epoch_output:
+        val_loss, val_accuracy, recall, auc, = evaluate(model, test_loader, device, multi_modal=multi_modal)
         
-      print(f"Loss: {running_loss/len(train_loader):.4f}")
-  print(f"Best Validation Accuracy: {best_accuracy:.4f}")
+        epoch_accuracies.append(val_accuracy)
+        epoch_aucs.append(auc)
+        epoch_losses.append(val_loss)
+        epoch_recalls.append(recall)
+    
   
-#   plt.figure(figsize=(10, 5))
-#   plt.subplot(1, 2, 1)
-#   plt.plot(losses)
-#   plt.title('Validation Loss')
-#   plt.xlabel('Epoch')
-#   plt.ylabel('Loss')
+  val_loss, val_accuracy, recall, auc = evaluate(model, test_loader, device, multi_modal=multi_modal)
 
-#   plt.subplot(1, 2, 2)
-#   plt.plot(accuracies)
-#   plt.title('Validation Accuracy')
-#   plt.xlabel('Epoch')
-#   plt.ylabel('Accuracy')
-#   plt.tight_layout()
-#   plt.savefig('output/loss_accuracy.png')
-#   plt.close()
+  return val_accuracy, recall, auc, (epoch_accuracies, epoch_aucs, epoch_losses, epoch_recalls)
 
-def evaluate(model, test_loader, epoch, device="cuda" ):
+
+def evaluate(model, test_loader, device, multi_modal=False ):
+    """Evaluate one fold and return (loss, accuracy, recall, auc)."""
     model.eval()
+    # For mixed-view mode, evaluation uses single-view selection through dataset state.
+    test_loader.dataset.dataset.is_train = False
     correct = 0
     total = 0
     all_labels = []
     all_predictions = []
+    all_probabilities = []
+    total_loss = 0.0
+    
+    criterion = nn.BCEWithLogitsLoss()
     
     with torch.no_grad():
-        for images, labels in test_loader:
+        for images, data in test_loader:
             predictions = []
             
+            labels = data[:,0].to(device).float()
+            age = None
+            weight = None
+                        
             for i in range(len(images)):
-                x = images[i][0].to(device).float().unsqueeze(0) # [0] <=== take only the first image to test
-                prediction = model(x, weight=weights.to(device).float().unsqueeze(1) if model.multi_modal else None)
+                x = images[i].to(device).float()
+                
+                if multi_modal:
+                  age = data[i][1].to(device).float().unsqueeze(0)
+                  weight = data[i][2].to(device).float().unsqueeze(0)                
+                
+                prediction = model(x, metadata=(age, weight) if model.multi_modal else None)
                 predictions.append(prediction)
-            
+
             labels = labels.to(device).float().unsqueeze(1)
+            logits = torch.cat(predictions)
+                        
+            probs = torch.sigmoid(logits)
+            predicted = (probs > 0.5).float()
             
-            predicted = (torch.sigmoid(torch.cat(predictions)) > 0.5).float()
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            
             all_labels.extend(labels.view(-1).cpu().numpy().tolist())
             all_predictions.extend(predicted.view(-1).cpu().numpy().tolist())
+            all_probabilities.extend(probs.view(-1).cpu().numpy().tolist())
             
-            loss = nn.BCEWithLogitsLoss()(torch.cat(predictions), labels)
+            loss = criterion(logits, labels)
+            total_loss += loss.item() * labels.size(0)
+
     
     accuracy = correct / total
     
-    print(f"Test Accuracy: {accuracy:.4f}")
-
-    # cm = confusion_matrix(all_labels, all_predictions)
-    # plt.figure(figsize=(5, 5))
-    # plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    # plt.title('Confusion Matrix')
-    # plt.colorbar()
-    # plt.xlabel('Predicted label')
-    # plt.ylabel('True label')
-    # plt.xticks([0, 1])
-    # plt.yticks([0, 1])
-
-    # for i in range(cm.shape[0]):
-    #     for j in range(cm.shape[1]):
-    #         plt.text(j, i, str(cm[i, j]), ha='center', va='center',
-    #                   color='white' if cm[i, j] > cm.max() / 2 else 'black')
-
-    # plt.tight_layout()
-    # plt.savefig(f'output/confusion_matrix_epoch_{epoch}.png')
-    # plt.close()
+    recall = recall_score(all_labels, all_predictions, zero_division=0)
     
-    return loss.item(), accuracy  # Return validation loss for scheduler (1 - accuracy) and accuracy
+    try:
+        auc = roc_auc_score(all_labels, all_probabilities)
+    except ValueError:
+        # AUC is undefined when predictions/labels contain only one class.
+        auc = float('nan')
+        
+    test_loader.dataset.dataset.is_train = True
+        
+    mean_loss = total_loss / total
+
+    return mean_loss, accuracy, recall, auc
